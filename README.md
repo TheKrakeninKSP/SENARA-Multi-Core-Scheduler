@@ -4,10 +4,12 @@ An asymmetric multi-core process scheduler with testbench and customizable param
 //Multi-Processor Scheduler  --- SENARA Scheduling Algorithm
 
 //3 types of cores -- Long Process [LP], General Purpose [GP], Fast Response [FR]
+
     //Long Proc cores run processes with large burst times, ideally background algorithms
         //LP Cores also have higher compute power and use more power
     //Fast Response cores preferably run GUI front-ends and such
         //FR Cores have lower compute power and low power usage
+        
 //Symmetric Multiprocessing Approach has issues with Imbalanced Load -- https://en.wikipedia.org/wiki/Symmetric_multiprocessing
 //Assume Shared Main Memory via a Common System Bus but Separate Cache for each Core
     //Resolving Cache Coherence is the System Bus' Responsibility

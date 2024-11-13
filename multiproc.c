@@ -53,7 +53,7 @@
 
 #define DEBUG 0             //1 for Printing Detailed Info, 0 Otherwise
 #define MODE PERFORMANCE    //chose between POWER_SAVING, PERFORMANCE, and BALANCED
-int NAIVE = 0;              //1 for using Naive scheduler, 0 for Advanced Scheduler, overridden by Command Line Argument
+int NAIVE = 0;              //1 for using Naive scheduler, 0 for Advanced Scheduler, 2 for Non-Preemptive Approach. overridden by Command Line Argument
 int NEW_SCHEDULE = 0;       //1 for Creating New Schedule, 0 To reuse previously created Schedule
 
 //DO NOT CHANGE
@@ -177,6 +177,7 @@ int ACTIVE_CORES = CORE_NUM;
 // Function prototypes
 void initialize_cores();
 void* global_scheduler(void* arg);
+void* global_scheduler_nonpreemp(void* arg);
 void set_mode(Mode new_mode);
 void display_core_status();
 void schedule_create();
@@ -185,6 +186,7 @@ int schedule_read(Process processes[MAX_PROCESSES]);
 void populate_global(int num_proc);
 int timeslice_mult(int core_type);
 void* core_func(void* arg);
+void* core_func_nonpreemp(void* arg);
 void clear_lp_buffer();
 void clear_fr_buffer();
 void* naive_scheduler(void* arg);
@@ -241,6 +243,9 @@ int main(int argc, char* argv[]) {
         NEW_SCHEDULE = 0;
         printf("\n<<---------------USING NAIVE SCHEDULING----------------->>\n");
     }
+    else if(NAIVE == 2) {
+        printf("\n<<---------------USING NON-PREEMPTIVE SCHEDULING----------------->>\n");
+    }   
     else {
         //uses NEW_SCHEDULE from definition in top of code
         printf("\n<<---------------USING ADVANCED SCHEDULING----------------->>\n");
@@ -276,11 +281,13 @@ int main(int argc, char* argv[]) {
     pthread_t pCores[CORE_NUM], scheduler;
     for(unsigned long i=0;i<ACTIVE_CORES;i++) {
         if(NAIVE == 0) pthread_create(&pCores[i], NULL, &core_func, (void*) i);
+        else if(NAIVE == 2) pthread_create(&pCores[i], NULL, &core_func_nonpreemp, (void*) i);
         else pthread_create(&pCores[i], NULL, &naive_core_func, (void*) i);
     }
 
     // Run the Global Scheduler
     if(NAIVE == 0) pthread_create(&scheduler, NULL, &global_scheduler, (void*) num_proc);
+    else if(NAIVE == 2) pthread_create(&scheduler, NULL, &global_scheduler_nonpreemp, (void*) num_proc);
     else pthread_create(&scheduler, NULL, &naive_scheduler, (void*) num_proc);
     
     // NOTE: Global Scheduler and All Cores Threads are dynamic and hence wait for future processes.
@@ -444,6 +451,36 @@ void* global_scheduler(void* arg) {
     }
 }
 
+void* global_scheduler_nonpreemp(void* arg) {
+    // Process global queue and assign tasks to appropriate cores/buffers
+    unsigned long num_proc = (unsigned long) arg;
+    int curr_time = 0;
+    Process* proc;
+
+    for(int i=0;i<num_proc;i++) {
+
+        proc = dequeue(&global_queue);
+        while(proc->arrival_time > curr_time) { //wait for arrival time
+            curr_time += STD_TIMESLICE;
+            usleep(STD_TIMESLICE);
+        }
+        int min_proc_queue_indx;
+        int min_proc_queue_num = __INT_MAX__;
+        Core* x_core;
+        for(int corenum = 0; corenum < ACTIVE_CORES; corenum++) {
+            x_core = &cores[corenum];
+            if(local_queue[x_core->id].qSize < min_proc_queue_num) {
+                min_proc_queue_num = local_queue[x_core->id].qSize;
+                min_proc_queue_indx = x_core->id;
+            }
+        }
+        x_core = &cores[min_proc_queue_indx];
+        proc->assigned_queue = x_core->core_type;
+        enqueue(&local_queue[min_proc_queue_indx], proc);
+        if(DEBUG) printf("Process %d Assigned to %s Core %d from Global Queue\n", proc->id, x_core->core_type_string, x_core->id);
+    }
+}
+
 int timeslice_mult(int core_type) {
     if(core_type == LP) return LP_TIMESLICE_MULT;
     if(core_type == GP) return GP_TIMESLICE_MULT;
@@ -501,6 +538,95 @@ void* core_func(void* arg) {
         else if(ptr->compute_req > compute) {
             //required compute more than compute of timeslice
             ptr->compute_req -= compute;
+        }
+        else {
+            int time_used_in_slice = time_slice * (ptr->compute_req / compute); 
+            core->wasted_time += (time_slice - time_used_in_slice);
+            currproc->chain_ptr = currproc->chain_ptr->next;
+        }
+
+        int finish = 0;
+        int change_core = 0;
+        if(currproc->chain_ptr == NULL) {
+            //process finished
+            if(DEBUG) printf("Process %d has FINISHED SUCCESSFULLY. ORDER %d\n", currproc->id, ++fin_proc_num);
+            currproc->completion_time = curr_time;
+            currproc->turnaround_time = currproc->completion_time - currproc->arrival_time;
+            currproc->waiting_time = currproc->turnaround_time - currproc->time_used;
+            finish = 1;
+        }
+        if(core->core_type == GP && finish == 0) {
+            if(currproc->time_used > LONG_PROC_THRESH) {
+                //SWITCH THIS PROCESS TO LP Core
+                change_core = 1;
+                if(DEBUG) printf("Process %d Removed from %s Core %d - Added to LP Buffer\n", currproc->id, core->core_type_string, core->id);
+                enqueue(&lp_buffer, currproc);
+            }
+
+            else if(currproc->interaction_ratio > INTER_RATIO_THRESH) {
+                //SWITCH THIS PROCESS TO FR Core
+                change_core = 1;
+                if(DEBUG) printf("Process %d Removed from %s Core %d - Added to FR Buffer\n", currproc->id, core->core_type_string, core->id);
+                enqueue(&fr_buffer, currproc);
+            }
+        }
+        if(finish == 0 && change_core == 0) {
+            enqueue(&local_queue[core->id], currproc);
+        }
+    }
+}
+
+void* core_func_nonpreemp(void* arg) {
+
+    unsigned long id = (unsigned long) arg;
+    Core* core = &cores[id];
+    int multiplier = timeslice_mult(core->core_type);
+    int time_slice = STD_TIMESLICE * multiplier;
+    int compute;
+    if(core->core_type == LP) compute = LP_COMPUTE * multiplier;
+    else if(core->core_type == FR) compute = FR_COMPUTE * multiplier;
+    else compute = GP_COMPUTE * multiplier;
+    int curr_time = 0;
+    
+    if(DEBUG) printf("Core::ID = %d, Type = %s\n", core->id, core->core_type_string);
+
+    while(1) {
+        while(local_queue[core->id].qSize <= 0) {
+            //waiting for process to come to local queue
+            core->idle_time += time_slice;
+            curr_time += time_slice;
+            usleep(time_slice);
+        };  
+
+        Process* currproc = dequeue(&local_queue[core->id]);
+
+        continue_label:
+        curr_time += time_slice; //tracking time
+        if(currproc == NULL) {
+            if(DEBUG) printf("<----------PROCESS QUEUE IS EMPTY FOR %s CORE id: %d------------>\n", core->core_type_string, core->id);
+            continue;
+        }
+
+        if(currproc->response_time == -1) currproc->response_time = curr_time - currproc->arrival_time;   //setting response time
+        struct process_chain* ptr = currproc->chain_ptr;
+
+        currproc->time_used += time_slice;
+        core->exec_time += time_slice; //for Core statistics tracking
+
+        if(ptr->compute_req == -1) {
+            // I/O request
+            currproc->relinquishings += 1;
+            if(currproc->relinquishings!=0) currproc->interaction_ratio = ((float)currproc->relinquishings / (float) currproc->time_used) * 100000;
+            currproc->chain_ptr = currproc->chain_ptr->next;
+            // I/O means processor doesn't actually take any time
+            curr_time -= time_slice;
+            currproc->time_used -= time_slice;
+            core->exec_time -= time_slice;
+        }
+        else if(ptr->compute_req > compute) {
+            //required compute more than compute of timeslice
+            ptr->compute_req -= compute;
+            goto continue_label;
         }
         else {
             int time_used_in_slice = time_slice * (ptr->compute_req / compute); 
